@@ -1,0 +1,5 @@
+{
+  "name": "claude-team-colors",
+  "owner": { "name": "ArdaYMC" },
+  "plugins": [{ "name": "ekip-renkleri", "source": "./" }]
+}
