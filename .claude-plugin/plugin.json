@@ -1,6 +1,6 @@
 {
   "name": "ekip-renkleri",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Oturumda kimin çalıştığını renkli küçük tuş avatarlarıyla gösterir: Claude, alt ajanlar (modele göre renk) ve Codex.",
   "license": "MIT",
   "author": { "name": "ArdaYMC" },

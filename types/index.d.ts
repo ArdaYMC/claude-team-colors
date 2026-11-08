@@ -17,9 +17,12 @@ export type Actor = {
   last: string
   /** Background shell id of a Codex run, to close it when its notice arrives. */
   taskId: string | null
+  /** Where a background run's output goes; polled for its exit line. */
+  outputFile: string | null
 }
 
-export type TimelineEvent = { at: number; actorId: string; text: string }
+/** A feed line carries its worker's kind and model, so it draws even after that worker is cleared. */
+export type TimelineEvent = { at: number; actorId: string; kind: ActorKind; model: string; text: string }
 
 declare module 'claude-code' {
   interface PluginState {

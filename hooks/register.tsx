@@ -4,13 +4,18 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import type { Actor, ActorKind, ActorStatus, TimelineEvent } from '../types'
 
 const PANE = 'ekip'
+const STALE_MS = 6 * 60 * 60 * 1000
+let poller: { cancel: () => void } | undefined
 
 // Change a tag when that value's fields change: it declines what an earlier version stored.
-const actors = atom({ plugin: 'ekip-renkleri', key: 'actors' } as const, [], { shape: 'actors-1' })
-const timeline = atom({ plugin: 'ekip-renkleri', key: 'timeline' } as const, [], { shape: 'timeline-1' })
+const actors = atom({ plugin: 'ekip-renkleri', key: 'actors' } as const, [], { shape: 'actors-2' })
+const timeline = atom({ plugin: 'ekip-renkleri', key: 'timeline' } as const, [], { shape: 'timeline-2' })
 
-const CODEX = /codex\.mjs|codex\.exe|\bcodex\s+exec\b/i
+// A Codex run is a command that runs it (node ...codex.mjs, codex(.exe) exec), not one that merely names the file.
+const CODEX = /(^|[;&|(]\s*)(node(\.exe)?\s+\S*codex\.mjs\b|\S*codex(\.exe)?["']?\s+exec\b)/i
 const BACKGROUND_ID = /background with ID:\s*([A-Za-z0-9_-]+)/
+const OUTPUT_FILE = /Output is being written to:\s*(.+?\.output)/
+const EXIT_LINE = /\[exited with code (-?\d+)\]\s*$/
 const TASK_NOTICE = /<task-id>([A-Za-z0-9_-]+)<\/task-id>[\s\S]*?<status>([a-z]+)<\/status>/g
 
 /** One colour per kind of worker; subagents by model family. */
@@ -83,17 +88,37 @@ async function upsert($: Engine, id: string, fn: (a: Actor | undefined) => Actor
   await update($, actors, list => {
     const found = list.find(a => a.id === id)
     const fresh = fn(found)
-    const rest = list.filter(a => a.id !== id)
-    // Keep Claude first, then the workers by start; drop the oldest beyond 40.
-    return [...rest, fresh]
-      .sort((a, b) => (a.id === 'claude' ? -1 : b.id === 'claude' ? 1 : a.startedAt - b.startedAt))
-      .slice(-40)
+    const all = [...list.filter(a => a.id !== id), fresh]
+    // Claude stays first; of the workers, keep the newest 39 by start.
+    const claude = all.filter(a => a.id === 'claude')
+    const workers = all.filter(a => a.id !== 'claude').sort((a, b) => a.startedAt - b.startedAt).slice(-39)
+    return [...claude, ...workers]
   })
+}
+
+/** Changes a worker that is still listed (and, with `onlyIf`, still in that state); otherwise nothing. */
+async function patch($: Engine, id: string, fields: Partial<Actor>, onlyIf?: ActorStatus): Promise<boolean> {
+  let changed = false
+  await update($, actors, list =>
+    list.map(a => {
+      if (a.id !== id || (onlyIf && a.status !== onlyIf)) return a
+      changed = true
+      return { ...a, ...fields }
+    }),
+  )
+  return changed
 }
 
 async function log($: Engine, actorId: string, text: string) {
   const at = await $.clock.now()
-  const entry: TimelineEvent = { at, actorId, text: clip(text, 90) }
+  const actor = (await read($, actors)).find(a => a.id === actorId)
+  const entry: TimelineEvent = {
+    at,
+    actorId,
+    kind: actor?.kind ?? (actorId === 'claude' ? 'claude' : actorId.startsWith('codex:') ? 'codex' : 'subagent'),
+    model: actor?.model ?? (actorId.startsWith('codex:') ? 'codex' : ''),
+    text: clip(text, 90),
+  }
   await update($, timeline, list => [...list, entry].slice(-120))
 }
 
@@ -122,6 +147,7 @@ async function ensureClaude($: Engine, status: ActorStatus) {
     tools: a?.tools ?? 0,
     last: a?.last ?? '',
     taskId: null,
+    outputFile: null,
   }))
 }
 
@@ -136,15 +162,54 @@ async function closeNotices($: Engine, text: string) {
     const actor = list.find(a => a.taskId === taskId && a.status === 'waiting')
     if (!actor) continue
     const failed = status !== 'completed'
-    await upsert($, actor.id, a => ({ ...(a as Actor), status: failed ? 'failed' : 'done', endedAt: now }))
-    await log($, actor.id, failed ? `durdu (${status})` : 'bitti')
+    if (await patch($, actor.id, { status: failed ? 'failed' : 'done', endedAt: now }, 'waiting')) {
+      await log($, actor.id, failed ? `durdu (${status})` : 'bitti')
+    }
   }
+}
+
+/** Background Codex runs end when their output file gets the shell's exit line. */
+async function pollBackground($: Engine) {
+  const list = await read($, actors)
+  const waiting = list.filter(a => a.status === 'waiting' && a.outputFile)
+  if (waiting.length === 0) return
+  const now = await $.clock.now()
+  for (const actor of waiting) {
+    let tail = ''
+    try {
+      const text = await $.fs.read(actor.outputFile as string)
+      tail = typeof text === 'string' ? text.slice(-400) : ''
+    } catch {
+      tail = ''
+    }
+    const exit = tail.match(EXIT_LINE)
+    if (exit) {
+      const code = Number(exit[1])
+      const ok = await patch($, actor.id, { status: code === 0 ? 'done' : 'failed', endedAt: now }, 'waiting')
+      if (ok) await log($, actor.id, code === 0 ? `bitti (${since(now - actor.startedAt)})` : `hata ile bitti (kod ${code})`)
+    } else if (now - actor.startedAt > STALE_MS) {
+      // Stopped from outside, or its output is gone: say so instead of waiting forever.
+      const ok = await patch($, actor.id, { status: 'failed', endedAt: now }, 'waiting')
+      if (ok) await log($, actor.id, 'sonucu bilinmiyor (6 saattir kapanmadı)')
+    }
+  }
+  await refreshStatus($)
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'ekip', description: 'Oturumda çalışan Claude, alt ajan ve Codex listesini aç' })
     void $.ui.open({ id: PANE, title: 'Ekip' })
+    poller?.cancel()
+    poller = $.clock.every(5000, async () => {
+      try {
+        await pollBackground($)
+      } catch {
+        // A failed poll waits for the next tick.
+      }
+      // Elapsed times move on their own: redraw the pane and band.
+      $.ui.invalidate('ui.render')
+    })
     return next(e)
   })
 
@@ -170,7 +235,7 @@ export const register: Register = on => {
       const id = e.agentId
       const list = await read($, actors)
       if (list.some(a => a.id === id)) {
-        await upsert($, id, a => ({ ...(a as Actor), status: e.isAborted ? 'failed' : 'done', endedAt: now }))
+        await patch($, id, { status: e.isAborted ? 'failed' : 'done', endedAt: now })
         await log($, id, e.isAborted ? 'durduruldu' : `bitti (${since(e.durationMs)})`)
       }
     }
@@ -195,6 +260,7 @@ export const register: Register = on => {
         tools: 0,
         last: '',
         taskId: null,
+        outputFile: null,
       }))
       await log($, id, `başladı: ${e.description || e.subagentType}`)
       await refreshStatus($)
@@ -210,7 +276,8 @@ export const register: Register = on => {
     if (owner === 'claude') await ensureClaude($, 'running')
     const list = await read($, actors)
     if (list.some(a => a.id === owner)) {
-      await upsert($, owner, a => ({ ...(a as Actor), tools: (a as Actor).tools + 1, last: clip(what, 60) }))
+      const prev = list.find(a => a.id === owner)
+      await patch($, owner, { tools: (prev?.tools ?? 0) + 1, last: clip(what, 60) })
     }
 
     if (!isCodex || e.tool !== 'Bash') return next(e)
@@ -230,23 +297,33 @@ export const register: Register = on => {
       tools: 0,
       last: '',
       taskId: null,
+      outputFile: null,
     }))
     await log($, codexId, `başladı: ${label}`)
     await refreshStatus($)
 
-    const ran = await next(e)
+    let ran: Awaited<ReturnType<typeof next>>
+    try {
+      ran = await next(e)
+    } catch (error) {
+      await patch($, codexId, { status: 'failed', endedAt: await $.clock.now() })
+      await log($, codexId, 'yarıda kaldı')
+      await refreshStatus($)
+      throw error
+    }
     const text = 'text' in ran && typeof ran.text === 'string' ? ran.text : ''
     const bg = text.match(BACKGROUND_ID)
     const now = await $.clock.now()
     if (ran.deny !== undefined) {
-      await upsert($, codexId, a => ({ ...(a as Actor), status: 'failed', endedAt: now }))
+      await patch($, codexId, { status: 'failed', endedAt: now })
       await log($, codexId, 'reddedildi')
     } else if (bg) {
-      await upsert($, codexId, a => ({ ...(a as Actor), status: 'waiting', taskId: bg[1] ?? null }))
+      const out = text.match(OUTPUT_FILE)?.[1]?.trim() ?? null
+      await patch($, codexId, { status: 'waiting', taskId: bg[1] ?? null, outputFile: out })
       await log($, codexId, 'arka planda sürüyor')
     } else {
       const failed = 'isError' in ran && ran.isError === true
-      await upsert($, codexId, a => ({ ...(a as Actor), status: failed ? 'failed' : 'done', endedAt: now }))
+      await patch($, codexId, { status: failed ? 'failed' : 'done', endedAt: now })
       await log($, codexId, failed ? 'hata ile bitti' : `bitti (${since(now - started)})`)
     }
     await refreshStatus($)
@@ -340,11 +417,12 @@ export const register: Register = on => {
         {events.length === 0 && <Text dimColor>Henüz bir şey olmadı.</Text>}
         {events.slice(-room).map(ev => {
           const a = byId.get(ev.actorId)
-          const color = a ? colorOf(a) : '#64748B'
+          const who = a ?? { kind: ev.kind, model: ev.model }
+          const name = who.kind === 'claude' ? 'Claude' : who.kind === 'codex' ? 'Codex' : modelName(who.model)
           return (
             <Box flexDirection="row" gap={1}>
               <Text dimColor>{since(now - ev.at)}</Text>
-              <Text color={color} bold>{a ? kindLabel(a) : '?'}</Text>
+              <Text color={colorOf(who)} bold>{name}</Text>
               <Text>{ev.text}</Text>
             </Box>
           )
